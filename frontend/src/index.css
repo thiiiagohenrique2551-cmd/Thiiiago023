@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+:root {
+  --bet365-green: #00a651;
+  --bet365-dark-green: #007a3d;
+  --bet365-bg: #0d1117;
+  --bet365-card: #161b22;
+  --bet365-card-hover: #1c2333;
+  --bet365-border: #30363d;
+  --bet365-text: #e6edf3;
+  --bet365-text-muted: #8b949e;
+  --bet365-gold: #ffd700;
+  --bet365-red: #f85149;
+  --bet365-orange: #f0883e;
+  --bet365-blue: #58a6ff;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background-color: var(--bet365-bg);
+  color: var(--bet365-text);
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bet365-bg); }
+::-webkit-scrollbar-thumb { background: var(--bet365-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--bet365-green); }
+
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.9); }
+}
+
+@keyframes slide-in {
+  from { transform: translateY(-8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.live-dot { animation: pulse-live 1.5s infinite; }
+.slide-in { animation: slide-in 0.3s ease-out; }
+
+.skeleton {
+  background: linear-gradient(90deg, #161b22 25%, #1c2333 50%, #161b22 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 4px;
+}
+
+.match-card {
+  transition: all 0.2s ease;
+  border: 1px solid #30363d;
+  cursor: pointer;
+}
+
+.match-card:hover {
+  border-color: #00a651;
+  box-shadow: 0 0 0 1px #00a651, 0 4px 20px rgba(0, 166, 81, 0.15);
+}
+
+.prob-bar { transition: width 1s ease-in-out; }
+
+.modal-overlay {
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(4px);
+}

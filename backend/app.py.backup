@@ -1,0 +1,658 @@
+"""
+XG Sports Analytics - Backend Flask
+Integração com API-Football para dados ao vivo de partidas reais
+"""
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import requests
+import math
+import time
+from functools import lru_cache
+import threading
+
+app = Flask(__name__)
+CORS(app, origins="*")
+
+# Configuração da API
+API_KEY = "0abfb64e6f4a41b042b382decfeaee6b"
+API_BASE_URL = "https://v3.football.api-sports.io"
+HEADERS = {
+    "x-apisports-key": API_KEY
+}
+
+# Cache simples em memória
+_cache = {}
+_cache_lock = threading.Lock()
+CACHE_TTL = 60  # 60 segundos de cache para dados ao vivo
+
+
+def get_cached(key, fetch_fn, ttl=CACHE_TTL):
+    """Cache simples com TTL"""
+    with _cache_lock:
+        if key in _cache:
+            data, timestamp = _cache[key]
+            if time.time() - timestamp < ttl:
+                return data
+        data = fetch_fn()
+        _cache[key] = (data, time.time())
+        return data
+
+
+def fetch_live_fixtures():
+    """Busca partidas ao vivo da API"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/fixtures",
+            headers=HEADERS,
+            params={"live": "all"},
+            timeout=15
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("response", [])
+        return []
+    except Exception as e:
+        print(f"Erro ao buscar partidas ao vivo: {e}")
+        return []
+
+
+def fetch_fixture_statistics(fixture_id):
+    """Busca estatísticas de uma partida específica"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/fixtures/statistics",
+            headers=HEADERS,
+            params={"fixture": fixture_id},
+            timeout=15
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("response", [])
+        return []
+    except Exception as e:
+        print(f"Erro ao buscar estatísticas: {e}")
+        return []
+
+
+def fetch_fixture_events(fixture_id):
+    """Busca eventos de uma partida (gols, cartões, etc.)"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/fixtures/events",
+            headers=HEADERS,
+            params={"fixture": fixture_id},
+            timeout=15
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("response", [])
+        return []
+    except Exception as e:
+        print(f"Erro ao buscar eventos: {e}")
+        return []
+
+
+def parse_stat_value(value):
+    """Converte valor de estatística para número"""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        if "%" in value:
+            return float(value.replace("%", ""))
+        try:
+            return float(value)
+        except:
+            return 0
+    return 0
+
+
+def calculate_xg_from_stats(stats_home, stats_away):
+    """
+    Calcula xG (Expected Goals) baseado nas estatísticas da partida.
+    Modelo baseado em:
+    - Chutes ao gol (alta probabilidade)
+    - Chutes totais
+    - Chutes dentro da área
+    - Ataques perigosos
+    - Posse de bola
+    - Escanteios
+    """
+    # Pesos para cálculo de xG
+    XG_SHOT_ON_GOAL = 0.35      # Chute ao gol = 35% de chance de gol
+    XG_SHOT_OFF_GOAL = 0.05     # Chute fora = 5% de chance
+    XG_SHOT_INSIDE_BOX = 0.15   # Chute dentro da área = 15%
+    XG_SHOT_OUTSIDE_BOX = 0.03  # Chute fora da área = 3%
+    XG_DANGEROUS_ATTACK = 0.08  # Ataque perigoso = 8% de contribuição
+    XG_CORNER = 0.03            # Escanteio = 3% de contribuição
+
+    def calc_team_xg(stats):
+        shots_on = parse_stat_value(stats.get("Shots on Goal", 0))
+        shots_off = parse_stat_value(stats.get("Shots off Goal", 0))
+        shots_inside = parse_stat_value(stats.get("Shots insidebox", 0))
+        shots_outside = parse_stat_value(stats.get("Shots outsidebox", 0))
+        blocked = parse_stat_value(stats.get("Blocked Shots", 0))
+        dangerous_attacks = parse_stat_value(stats.get("Dangerous Attacks", 0))
+        corners = parse_stat_value(stats.get("Corner Kicks", 0))
+        possession = parse_stat_value(stats.get("Ball Possession", 50))
+
+        # Cálculo de xG
+        xg = (
+            shots_on * XG_SHOT_ON_GOAL +
+            shots_off * XG_SHOT_OFF_GOAL +
+            shots_inside * XG_SHOT_INSIDE_BOX +
+            shots_outside * XG_SHOT_OUTSIDE_BOX +
+            dangerous_attacks * XG_DANGEROUS_ATTACK +
+            corners * XG_CORNER
+        )
+
+        # Ajuste por posse de bola (times com mais posse tendem a criar mais chances)
+        possession_factor = 1 + (possession - 50) * 0.005
+        xg = xg * possession_factor
+
+        return round(max(0, xg), 2)
+
+    xg_home = calc_team_xg(stats_home)
+    xg_away = calc_team_xg(stats_away)
+
+    return xg_home, xg_away
+
+
+def calculate_win_probability(stats_home, stats_away, score_home, score_away, minute):
+    """
+    Calcula probabilidade de vitória em tempo real baseado em:
+    - Placar atual
+    - xG calculado
+    - Ataques e ataques perigosos
+    - Posse de bola
+    - Minuto da partida
+    """
+    # Estatísticas base
+    shots_on_home = parse_stat_value(stats_home.get("Shots on Goal", 0))
+    shots_on_away = parse_stat_value(stats_away.get("Shots on Goal", 0))
+    attacks_home = parse_stat_value(stats_home.get("Attacks", 0))
+    attacks_away = parse_stat_value(stats_away.get("Attacks", 0))
+    dangerous_home = parse_stat_value(stats_home.get("Dangerous Attacks", 0))
+    dangerous_away = parse_stat_value(stats_away.get("Dangerous Attacks", 0))
+    possession_home = parse_stat_value(stats_home.get("Ball Possession", 50))
+    corners_home = parse_stat_value(stats_home.get("Corner Kicks", 0))
+    corners_away = parse_stat_value(stats_away.get("Corner Kicks", 0))
+    touches_home = parse_stat_value(stats_home.get("Passes accurate", 0))
+    touches_away = parse_stat_value(stats_away.get("Passes accurate", 0))
+
+    # Calcular xG
+    xg_home, xg_away = calculate_xg_from_stats(stats_home, stats_away)
+
+    # Score atual influencia muito a probabilidade
+    score_diff = score_home - score_away
+    minute_remaining = max(1, 90 - minute)
+    time_factor = minute / 90  # Quanto mais avançado o jogo, mais o placar pesa
+
+    # Pontuação de desempenho para cada time
+    perf_home = (
+        shots_on_home * 3 +
+        dangerous_home * 2 +
+        attacks_home * 0.5 +
+        corners_home * 1.5 +
+        possession_home * 0.1 +
+        xg_home * 10
+    )
+
+    perf_away = (
+        shots_on_away * 3 +
+        dangerous_away * 2 +
+        attacks_away * 0.5 +
+        corners_away * 1.5 +
+        (100 - possession_home) * 0.1 +
+        xg_away * 10
+    )
+
+    total_perf = perf_home + perf_away
+    if total_perf == 0:
+        base_home = 0.45
+        base_away = 0.45
+    else:
+        base_home = perf_home / total_perf
+        base_away = perf_away / total_perf
+
+    # Ajuste pelo placar atual
+    # Quanto mais avançado o jogo, mais o placar influencia
+    score_adjustment = score_diff * 0.15 * time_factor
+
+    prob_home = base_home + score_adjustment
+    prob_away = base_away - score_adjustment
+
+    # Probabilidade de empate baseada na proximidade dos times
+    diff_abs = abs(prob_home - prob_away)
+    draw_base = max(0.05, 0.35 - diff_abs * 0.5)
+
+    # Ajuste pelo placar para empate
+    if score_diff == 0:
+        draw_base = min(0.45, draw_base + 0.1 * time_factor)
+    else:
+        draw_base = max(0.02, draw_base - abs(score_diff) * 0.08 * time_factor)
+
+    # Normalizar
+    total = prob_home + prob_away + draw_base
+    prob_home = max(0.02, prob_home / total)
+    prob_away = max(0.02, prob_away / total)
+    prob_draw = max(0.02, draw_base / total)
+
+    # Renormalizar após garantir mínimos
+    total = prob_home + prob_away + prob_draw
+    prob_home /= total
+    prob_away /= total
+    prob_draw /= total
+
+    return {
+        "home": round(prob_home * 100, 1),
+        "draw": round(prob_draw * 100, 1),
+        "away": round(prob_away * 100, 1)
+    }
+
+
+def calculate_goal_probability(stats_home, stats_away, score_home, score_away, minute):
+    """
+    Calcula probabilidade de sair mais gols na partida
+    Baseado em xG, ataques perigosos, chutes ao gol e ritmo da partida
+    """
+    xg_home, xg_away = calculate_xg_from_stats(stats_home, stats_away)
+    total_xg = xg_home + xg_away
+
+    dangerous_home = parse_stat_value(stats_home.get("Dangerous Attacks", 0))
+    dangerous_away = parse_stat_value(stats_away.get("Dangerous Attacks", 0))
+    shots_on_home = parse_stat_value(stats_home.get("Shots on Goal", 0))
+    shots_on_away = parse_stat_value(stats_away.get("Shots on Goal", 0))
+    corners_home = parse_stat_value(stats_home.get("Corner Kicks", 0))
+    corners_away = parse_stat_value(stats_away.get("Corner Kicks", 0))
+
+    # Ritmo de jogo (ataques por minuto)
+    minute_safe = max(1, minute)
+    attack_rate = (dangerous_home + dangerous_away) / minute_safe
+    shot_rate = (shots_on_home + shots_on_away) / minute_safe
+    corner_rate = (corners_home + corners_away) / minute_safe
+
+    # Probabilidade base de gol nos próximos 15 minutos
+    minutes_remaining = max(0, 90 - minute)
+    expected_goals_remaining = (
+        attack_rate * minutes_remaining * 0.04 +
+        shot_rate * minutes_remaining * 0.12 +
+        corner_rate * minutes_remaining * 0.03 +
+        total_xg * 0.3
+    )
+
+    # Converter para probabilidade (usando distribuição de Poisson simplificada)
+    # P(pelo menos 1 gol) = 1 - P(0 gols) = 1 - e^(-lambda)
+    prob_goal = 1 - math.exp(-expected_goals_remaining)
+    prob_goal = min(0.98, max(0.02, prob_goal))
+
+    return round(prob_goal * 100, 1)
+
+
+def calculate_corner_probability(stats_home, stats_away, minute):
+    """Calcula probabilidade de mais escanteios"""
+    corners_home = parse_stat_value(stats_home.get("Corner Kicks", 0))
+    corners_away = parse_stat_value(stats_away.get("Corner Kicks", 0))
+    total_corners = corners_home + corners_away
+
+    minute_safe = max(1, minute)
+    corner_rate = total_corners / minute_safe  # Escanteios por minuto
+
+    minutes_remaining = max(0, 90 - minute)
+    expected_corners = corner_rate * minutes_remaining
+
+    # Probabilidade de pelo menos mais 1 escanteio
+    prob_corner = 1 - math.exp(-expected_corners)
+    prob_corner = min(0.99, max(0.05, prob_corner))
+
+    return round(prob_corner * 100, 1)
+
+
+def calculate_over_under_probabilities(stats_home, stats_away, score_home, score_away, minute):
+    """
+    Calcula probabilidades de Over/Under para 1.5, 2.5, 3.5 gols.
+    Usa xG, ataques perigosos e ritmo da partida para estimar gols restantes.
+    """
+    xg_home, xg_away = calculate_xg_from_stats(stats_home, stats_away)
+    total_xg = xg_home + xg_away
+
+    # Estatísticas de ataque
+    attacks_home = parse_stat_value(stats_home.get("Attacks", 0))
+    attacks_away = parse_stat_value(stats_away.get("Attacks", 0))
+    dangerous_home = parse_stat_value(stats_home.get("Dangerous Attacks", 0))
+    dangerous_away = parse_stat_value(stats_away.get("Dangerous Attacks", 0))
+    shots_on_home = parse_stat_value(stats_home.get("Shots on Goal", 0))
+    shots_on_away = parse_stat_value(stats_away.get("Shots on Goal", 0))
+
+    # Gols já marcados
+    current_total_goals = score_home + score_away
+
+    # Ritmo de gols por minuto
+    minute_safe = max(1, minute)
+    goal_rate = current_total_goals / minute_safe if minute_safe > 0 else 0
+
+    # Minutos restantes
+    minutes_remaining = max(0, 90 - minute)
+
+    # Estimar gols esperados nos minutos restantes
+    # Usar combinação de: xG, ritmo atual, ataques perigosos
+    attack_intensity = (dangerous_home + dangerous_away) / max(1, minute_safe)
+    shot_intensity = (shots_on_home + shots_on_away) / max(1, minute_safe)
+
+    # Gols esperados nos minutos restantes
+    expected_goals_remaining = (
+        goal_rate * minutes_remaining * 0.7 +  # Continuar ritmo atual
+        total_xg * 0.25 +  # xG contribui para previsão
+        attack_intensity * minutes_remaining * 0.05  # Ataques perigosos
+    )
+
+    # Total esperado de gols (atual + esperado)
+    total_expected_goals = current_total_goals + expected_goals_remaining
+
+    # Usar distribuição de Poisson para calcular probabilidades
+    # P(X > k) = 1 - P(X <= k) onde X ~ Poisson(lambda)
+    def poisson_cdf(k, lambda_val):
+        """Calcula CDF de Poisson: P(X <= k)"""
+        if lambda_val == 0:
+            return 1.0 if k >= 0 else 0.0
+        result = 0
+        for i in range(int(k) + 1):
+            result += (lambda_val ** i * math.exp(-lambda_val)) / math.factorial(i)
+        return min(1.0, result)
+
+    # Probabilidades Over/Under
+    # Over 1.5 = P(total > 1.5) = 1 - P(total <= 1)
+    prob_over_1_5 = 1 - poisson_cdf(1, total_expected_goals)
+    # Over 2.5 = P(total > 2.5) = 1 - P(total <= 2)
+    prob_over_2_5 = 1 - poisson_cdf(2, total_expected_goals)
+    # Over 3.5 = P(total > 3.5) = 1 - P(total <= 3)
+    prob_over_3_5 = 1 - poisson_cdf(3, total_expected_goals)
+
+    return {
+        "over_1_5": round(prob_over_1_5 * 100, 1),
+        "under_1_5": round((1 - prob_over_1_5) * 100, 1),
+        "over_2_5": round(prob_over_2_5 * 100, 1),
+        "under_2_5": round((1 - prob_over_2_5) * 100, 1),
+        "over_3_5": round(prob_over_3_5 * 100, 1),
+        "under_3_5": round((1 - prob_over_3_5) * 100, 1),
+        "expected_total_goals": round(total_expected_goals, 2),
+        "expected_remaining_goals": round(expected_goals_remaining, 2)
+    }
+
+
+def process_fixture(fixture_data):
+    """Processa dados de uma partida e calcula todas as métricas"""
+    fixture = fixture_data.get("fixture", {})
+    league = fixture_data.get("league", {})
+    teams = fixture_data.get("teams", {})
+    goals = fixture_data.get("goals", {})
+    score = fixture_data.get("score", {})
+
+    fixture_id = fixture.get("id")
+    minute = fixture.get("status", {}).get("elapsed", 0) or 0
+
+    # Buscar estatísticas
+    stats_data = fetch_fixture_statistics(fixture_id)
+
+    stats_home = {}
+    stats_away = {}
+
+    for team_stats in stats_data:
+        team_id = team_stats.get("team", {}).get("id")
+        home_team_id = teams.get("home", {}).get("id")
+        statistics = team_stats.get("statistics", [])
+
+        stat_dict = {}
+        for stat in statistics:
+            stat_type = stat.get("type", "")
+            stat_value = stat.get("value")
+            stat_dict[stat_type] = stat_value
+
+        if team_id == home_team_id:
+            stats_home = stat_dict
+        else:
+            stats_away = stat_dict
+
+    score_home = goals.get("home", 0) or 0
+    score_away = goals.get("away", 0) or 0
+
+    # Calcular métricas
+    xg_home, xg_away = calculate_xg_from_stats(stats_home, stats_away)
+    win_prob = calculate_win_probability(stats_home, stats_away, score_home, score_away, minute)
+    goal_prob = calculate_goal_probability(stats_home, stats_away, score_home, score_away, minute)
+    corner_prob = calculate_corner_probability(stats_home, stats_away, minute)
+    over_under = calculate_over_under_probabilities(stats_home, stats_away, score_home, score_away, minute)
+
+    # Score de ranking (quanto mais xG total, mais no topo)
+    total_xg = xg_home + xg_away
+    dangerous_total = (
+        parse_stat_value(stats_home.get("Dangerous Attacks", 0)) +
+        parse_stat_value(stats_away.get("Dangerous Attacks", 0))
+    )
+    ranking_score = total_xg * 10 + dangerous_total * 0.5 + goal_prob * 0.3
+
+    return {
+        "fixture_id": fixture_id,
+        "league": {
+            "id": league.get("id"),
+            "name": league.get("name"),
+            "country": league.get("country"),
+            "logo": league.get("logo"),
+            "flag": league.get("flag"),
+            "round": league.get("round")
+        },
+        "teams": {
+            "home": {
+                "id": teams.get("home", {}).get("id"),
+                "name": teams.get("home", {}).get("name"),
+                "logo": teams.get("home", {}).get("logo"),
+                "winner": teams.get("home", {}).get("winner")
+            },
+            "away": {
+                "id": teams.get("away", {}).get("id"),
+                "name": teams.get("away", {}).get("name"),
+                "logo": teams.get("away", {}).get("logo"),
+                "winner": teams.get("away", {}).get("winner")
+            }
+        },
+        "score": {
+            "home": score_home,
+            "away": score_away
+        },
+        "minute": minute,
+        "status": fixture.get("status", {}).get("short", ""),
+        "status_long": fixture.get("status", {}).get("long", ""),
+        "xg": {
+            "home": xg_home,
+            "away": xg_away,
+            "total": round(total_xg, 2)
+        },
+        "win_probability": win_prob,
+        "goal_probability": goal_prob,
+        "corner_probability": corner_prob,
+        "over_under": over_under,
+        "ranking_score": round(ranking_score, 2),
+        "statistics": {
+            "home": {
+                "shots_on_goal": parse_stat_value(stats_home.get("Shots on Goal", 0)),
+                "shots_off_goal": parse_stat_value(stats_home.get("Shots off Goal", 0)),
+                "total_shots": parse_stat_value(stats_home.get("Total Shots", 0)),
+                "shots_inside_box": parse_stat_value(stats_home.get("Shots insidebox", 0)),
+                "shots_outside_box": parse_stat_value(stats_home.get("Shots outsidebox", 0)),
+                "blocked_shots": parse_stat_value(stats_home.get("Blocked Shots", 0)),
+                "fouls": parse_stat_value(stats_home.get("Fouls", 0)),
+                "corners": parse_stat_value(stats_home.get("Corner Kicks", 0)),
+                "offsides": parse_stat_value(stats_home.get("Offsides", 0)),
+                "possession": parse_stat_value(stats_home.get("Ball Possession", 50)),
+                "yellow_cards": parse_stat_value(stats_home.get("Yellow Cards", 0)),
+                "red_cards": parse_stat_value(stats_home.get("Red Cards", 0)),
+                "saves": parse_stat_value(stats_home.get("Goalkeeper Saves", 0)),
+                "total_passes": parse_stat_value(stats_home.get("Total passes", 0)),
+                "accurate_passes": parse_stat_value(stats_home.get("Passes accurate", 0)),
+                "passes_pct": parse_stat_value(stats_home.get("Passes %", 0)),
+                "attacks": parse_stat_value(stats_home.get("Attacks", 0)),
+                "dangerous_attacks": parse_stat_value(stats_home.get("Dangerous Attacks", 0))
+            },
+            "away": {
+                "shots_on_goal": parse_stat_value(stats_away.get("Shots on Goal", 0)),
+                "shots_off_goal": parse_stat_value(stats_away.get("Shots off Goal", 0)),
+                "total_shots": parse_stat_value(stats_away.get("Total Shots", 0)),
+                "shots_inside_box": parse_stat_value(stats_away.get("Shots insidebox", 0)),
+                "shots_outside_box": parse_stat_value(stats_away.get("Shots outsidebox", 0)),
+                "blocked_shots": parse_stat_value(stats_away.get("Blocked Shots", 0)),
+                "fouls": parse_stat_value(stats_away.get("Fouls", 0)),
+                "corners": parse_stat_value(stats_away.get("Corner Kicks", 0)),
+                "offsides": parse_stat_value(stats_away.get("Offsides", 0)),
+                "possession": parse_stat_value(stats_away.get("Ball Possession", 50)),
+                "yellow_cards": parse_stat_value(stats_away.get("Yellow Cards", 0)),
+                "red_cards": parse_stat_value(stats_away.get("Red Cards", 0)),
+                "saves": parse_stat_value(stats_away.get("Goalkeeper Saves", 0)),
+                "total_passes": parse_stat_value(stats_away.get("Total passes", 0)),
+                "accurate_passes": parse_stat_value(stats_away.get("Passes accurate", 0)),
+                "passes_pct": parse_stat_value(stats_away.get("Passes %", 0)),
+                "attacks": parse_stat_value(stats_away.get("Attacks", 0)),
+                "dangerous_attacks": parse_stat_value(stats_away.get("Dangerous Attacks", 0))
+            }
+        }
+    }
+
+
+@app.route("/api/live-matches", methods=["GET"])
+def get_live_matches():
+    """
+    Retorna todas as partidas ao vivo com ranking por probabilidade de gol.
+    As partidas com maior chance de gol aparecem no topo.
+    """
+    try:
+        live_fixtures = get_cached("live_fixtures", fetch_live_fixtures, ttl=60)
+
+        if not live_fixtures:
+            return jsonify({
+                "success": True,
+                "count": 0,
+                "matches": [],
+                "message": "Nenhuma partida ao vivo no momento"
+            })
+
+        # Processar apenas partidas reais (não virtuais)
+        # Filtrar por status ao vivo: 1H, 2H, ET, BT, P, SUSP, INT
+        live_statuses = {"1H", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"}
+        processed_matches = []
+
+        for fixture_data in live_fixtures:
+            status = fixture_data.get("fixture", {}).get("status", {}).get("short", "")
+            if status in live_statuses:
+                try:
+                    processed = process_fixture(fixture_data)
+                    processed_matches.append(processed)
+                except Exception as e:
+                    print(f"Erro ao processar partida: {e}")
+                    continue
+
+        # Ordenar por ranking_score (maior xG e probabilidade de gol no topo)
+        processed_matches.sort(key=lambda x: x["ranking_score"], reverse=True)
+
+        return jsonify({
+            "success": True,
+            "count": len(processed_matches),
+            "matches": processed_matches,
+            "last_updated": time.strftime("%H:%M:%S")
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "matches": []
+        }), 500
+
+
+@app.route("/api/match/<int:fixture_id>", methods=["GET"])
+def get_match_detail(fixture_id):
+    """Retorna detalhes completos de uma partida específica"""
+    try:
+        # Buscar partida específica
+        response = requests.get(
+            f"{API_BASE_URL}/fixtures",
+            headers=HEADERS,
+            params={"id": fixture_id},
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            return jsonify({"success": False, "error": "Partida não encontrada"}), 404
+
+        data = response.json()
+        fixtures = data.get("response", [])
+
+        if not fixtures:
+            return jsonify({"success": False, "error": "Partida não encontrada"}), 404
+
+        processed = process_fixture(fixtures[0])
+
+        # Buscar eventos
+        events = fetch_fixture_events(fixture_id)
+        processed["events"] = events
+
+        return jsonify({
+            "success": True,
+            "match": processed
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/api/status", methods=["GET"])
+def get_api_status():
+    """Verifica status da API"""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/status",
+            headers=HEADERS,
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return jsonify({
+                "success": True,
+                "api_status": data.get("response", {})
+            })
+        return jsonify({"success": False, "error": "API indisponível"}), 503
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 503
+
+
+@app.route("/api/leagues", methods=["GET"])
+def get_available_leagues():
+    """Retorna ligas disponíveis nas partidas ao vivo"""
+    try:
+        live_fixtures = get_cached("live_fixtures", fetch_live_fixtures, ttl=60)
+        leagues = {}
+        for fixture in live_fixtures:
+            league = fixture.get("league", {})
+            league_id = league.get("id")
+            if league_id and league_id not in leagues:
+                leagues[league_id] = {
+                    "id": league_id,
+                    "name": league.get("name"),
+                    "country": league.get("country"),
+                    "logo": league.get("logo"),
+                    "flag": league.get("flag")
+                }
+
+        return jsonify({
+            "success": True,
+            "leagues": list(leagues.values())
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
